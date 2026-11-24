@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PostPilot</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --line:#2a2f3a; --text:#e8eaf0; --mute:#8b93a7; --accent:#7c5cff;
+          --ok:#2ecc71; --bad:#ff5d5d; --warn:#f5a623; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:12px; padding:14px 20px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:18px; margin:0; } .spacer { flex:1; }
+  .badge { font-size:12px; padding:3px 8px; border-radius:99px; background:var(--panel); border:1px solid var(--line); color:var(--mute); }
+  .badge.dry { color:var(--warn); border-color:var(--warn); }
+  button { background:var(--accent); color:#fff; border:0; padding:8px 14px; border-radius:8px; cursor:pointer; font:inherit; }
+  button.ghost { background:var(--panel); border:1px solid var(--line); color:var(--text); }
+  button.danger { background:var(--bad); }
+  main { padding:20px; max-width:1200px; margin:auto; }
+  .nav { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+  .nav h2 { margin:0 8px; min-width:180px; text-align:center; font-size:16px; }
+  .grid { display:grid; grid-template-columns:repeat(7,1fr); gap:1px; background:var(--line); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .dow { background:var(--panel); padding:6px; text-align:center; color:var(--mute); font-size:12px; }
+  .day { background:var(--bg); min-height:104px; padding:4px; cursor:pointer; }
+  .day:hover { background:#14171d; } .day.other { opacity:.35; } .day.today .n { color:var(--accent); font-weight:700; }
+  .n { font-size:12px; color:var(--mute); }
+  .chip { display:flex; gap:4px; align-items:center; font-size:11px; margin-top:3px; padding:2px 5px; border-radius:5px; background:var(--panel);
+          border-left:3px solid var(--accent); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:pointer; }
+  .chip.published { border-color:var(--ok); } .chip.failed { border-color:var(--bad); } .chip.publishing { border-color:var(--warn); }
+  dialog { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:12px; padding:20px; width:min(480px,92vw); }
+  dialog::backdrop { background:#000a; }
+  label { display:block; margin:12px 0 4px; color:var(--mute); font-size:12px; }
+  textarea, input[type=datetime-local], input[type=file] { width:100%; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:8px; font:inherit; }
+  textarea { min-height:110px; resize:vertical; }
+  .plats { display:flex; flex-wrap:wrap; gap:8px; }
+  .plats label { display:flex; align-items:center; gap:6px; margin:0; padding:6px 10px; border:1px solid var(--line); border-radius:8px; color:var(--text); cursor:pointer; font-size:13px; }
+  .plats input:disabled + span { opacity:.4; }
+  .row { display:flex; gap:8px; justify-content:flex-end; margin-top:16px; }
+  .err { color:var(--bad); margin-top:8px; min-height:1em; }
+  .t { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--line); font-size:13px; }
+  .acct { display:flex; align-items:center; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--line); }
+  .conn { padding:8px 0; border-bottom:1px solid var(--line); }
+  .conn small { display:block; color:var(--mute); margin-top:4px; word-break:break-all; }
+  .flash { padding:8px 10px; border-radius:8px; margin-bottom:8px; } .flash.ok { background:#2ecc7122; } .flash.bad { background:#ff5d5d22; }
+  .pending { font-size:12px; color:var(--mute); }
+  img.prev, video.prev { max-width:100%; max-height:200px; border-radius:8px; margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>✈️ PostPilot</h1>
+  <span id="mode" class="badge"></span>
+  <div class="spacer"></div>
+  <button class="ghost" id="acctBtn">Accounts</button>
+  <button id="newBtn">+ New post</button>
+</header>
+<main>
+  <div class="nav">
+    <button class="ghost" id="prev">‹</button><h2 id="title"></h2><button class="ghost" id="next">›</button>
+    <button class="ghost" id="today">Today</button>
+  </div>
+  <div class="grid" id="grid"></div>
+</main>
+
+<dialog id="composer">
+  <form id="form">
+    <h3 style="margin:0">Schedule a post</h3>
+    <label>Caption</label><textarea name="caption" placeholder="Write something…"></textarea>
+    <label>Media (image or video)</label><input type="file" name="media" accept="image/*,video/*">
+    <label>Platforms</label><div class="plats" id="plats"></div>
+    <label>Publish at (your local time)</label><input type="datetime-local" name="when" required>
+    <div class="err" id="err"></div>
+    <div class="row"><button type="button" class="ghost" id="cancel">Cancel</button><button>Schedule</button></div>
+  </form>
+</dialog>
+
+<dialog id="accounts">
+  <h3 style="margin:0 0 8px">Connected accounts</h3>
+  <div id="flash"></div>
+  <div id="acctList"></div>
+  <h4 style="margin:16px 0 4px">Connect</h4>
+  <div id="connectors"></div>
+  <div class="row"><button class="ghost" id="acctClose">Close</button></div>
+</dialog>
+
+<dialog id="detail"><div id="detailBody"></div></dialog>
+
+<script>
+const PLATFORMS = { instagram:'📸 Instagram', facebook:'👍 Facebook', tiktok:'🎵 TikTok', youtube:'▶️ YouTube' };
+let posts = [], status = {}, accounts = [], connectors = [], cur = new Date(); cur.setDate(1);
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const $ = (s) => document.querySelector(s);
+const pad = (n) => String(n).padStart(2, '0');
+const toLocalInput = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+const overall = (p) => p.targets.some(t=>t.status==='failed') ? 'failed'
+  : p.targets.every(t=>t.status==='published') ? 'published'
+  : p.targets.some(t=>t.status==='publishing') ? 'publishing' : 'scheduled';
+
+async function load() {
+  let a;
+  [posts, status, a] = await Promise.all(['/api/posts','/api/status','/api/accounts'].map(u => fetch(u).then(r=>r.json())));
+  accounts = a.accounts; connectors = a.connectors;
+  $('#mode').textContent = status.dryRun ? 'DRY RUN — nothing is posted' : 'LIVE';
+  $('#mode').className = 'badge' + (status.dryRun ? ' dry' : '');
+  render();
+}
+
+function render() {
+  $('#title').textContent = cur.toLocaleString(undefined, { month:'long', year:'numeric' });
+  const g = $('#grid'); g.innerHTML = '';
+  ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].forEach(d => g.insertAdjacentHTML('beforeend', `<div class="dow">${d}</div>`));
+  const start = new Date(cur); start.setDate(1 - ((cur.getDay() + 6) % 7));
+  const todayKey = new Date().toDateString();
+  for (let i = 0; i < 42; i++) {
+    const d = new Date(start); d.setDate(start.getDate() + i);
+    const el = document.createElement('div');
+    el.className = 'day' + (d.getMonth() !== cur.getMonth() ? ' other' : '') + (d.toDateString() === todayKey ? ' today' : '');
+    el.innerHTML = `<div class="n">${d.getDate()}</div>`;
+    el.onclick = () => openComposer(d);
+    posts.filter(p => new Date(p.scheduled_at).toDateString() === d.toDateString()).forEach(p => {
+      const c = document.createElement('div');
+      const t = new Date(p.scheduled_at);
+      c.className = 'chip ' + overall(p);
+      c.textContent = `${pad(t.getHours())}:${pad(t.getMinutes())} ${p.caption || '(no caption)'}`;
+      c.onclick = (e) => { e.stopPropagation(); openDetail(p); };
+      el.append(c);
+    });
+    g.append(el);
+  }
+}
+
+function openComposer(day) {
+  const f = $('#form'); f.reset(); $('#err').textContent = '';
+  const d = new Date(day); if (d < new Date()) { const n = new Date(); d.setFullYear(n.getFullYear(), n.getMonth(), n.getDate()); }
+  d.setHours(d.getHours() || 9, 0, 0, 0); if (d < new Date()) d.setTime(Date.now() + 10*60000);
+  f.when.value = toLocalInput(d);
+  $('#plats').innerHTML = accounts.length ? accounts.map(a =>
+    `<label><input type="checkbox" value="${a.id}"><span>${PLATFORMS[a.platform]} · ${esc(a.name)}${a.needsReconnect ? ' (reconnect)' : ''}</span></label>`).join('')
+    : '<span class="pending">No accounts yet. Use the Accounts button to connect one.</span>';
+  $('#composer').showModal();
+}
+
+$('#form').onsubmit = async (e) => {
+  e.preventDefault();
+  const f = e.target, fd = new FormData();
+  fd.set('caption', f.caption.value);
+  fd.set('accounts', [...document.querySelectorAll('#plats input:checked')].map(i=>i.value).join(','));
+  fd.set('scheduledAt', new Date(f.when.value).toISOString());
+  if (f.media.files[0]) fd.set('media', f.media.files[0]);
+  const r = await fetch('/api/posts', { method:'POST', body: fd });
+  if (!r.ok) { $('#err').textContent = (await r.json()).error; return; }
+  $('#composer').close(); load();
+};
+
+function openDetail(p) {
+  const media = p.media_file ? (p.media_type === 'video'
+    ? `<video class="prev" controls src="/media/${p.media_file}"></video>` : `<img class="prev" src="/media/${p.media_file}">`) : '';
+  $('#detailBody').innerHTML = `
+    <h3 style="margin:0 0 4px">${new Date(p.scheduled_at).toLocaleString()}</h3>
+    <p style="white-space:pre-wrap">${p.caption.replace(/</g,'&lt;') || '<i>No caption</i>'}</p>${media}
+    <div style="margin-top:12px">${p.targets.map(t => `<div class="t"><span>${PLATFORMS[t.platform]} · ${esc(t.account_name || 'disconnected')}</span>
+      <span>${t.status}${t.error ? ` — <span style="color:var(--bad)">${t.error.replace(/</g,'&lt;')}</span>` : ''}</span></div>`).join('')}</div>
+    <div class="row">
+      ${p.targets.some(t=>t.status==='failed') ? '<button id="retry">Retry</button>' : ''}
+      <button class="danger" id="del">Delete</button><button class="ghost" id="close">Close</button>
+    </div>`;
+  $('#detail').showModal();
+  $('#close').onclick = () => $('#detail').close();
+  $('#del').onclick = async () => { if (confirm('Delete this post?')) { await fetch('/api/posts/'+p.id, {method:'DELETE'}); $('#detail').close(); load(); } };
+  if ($('#retry')) $('#retry').onclick = async () => { await fetch(`/api/posts/${p.id}/retry`, {method:'POST'}); $('#detail').close(); load(); };
+}
+
+function openAccounts(flash) {
+  $('#flash').innerHTML = flash ? `<div class="flash ${flash.ok ? 'ok' : 'bad'}">${esc(flash.msg)}</div>` : '';
+  $('#acctList').innerHTML = accounts.length ? accounts.map(a => `<div class="acct">
+      <span>${PLATFORMS[a.platform]} · ${esc(a.name)}${a.needsReconnect ? ' <b style="color:var(--bad)">needs reconnect</b>' : ''}</span>
+      <button class="ghost" data-rm="${a.id}">Disconnect</button></div>`).join('')
+    : '<div class="pending">Nothing connected yet.</div>';
+  $('#connectors').innerHTML = connectors.map(c => `<div class="conn">
+      <div style="display:flex;justify-content:space-between;align-items:center"><span>${c.label}</span>
+      ${c.configured ? `<a href="/auth/${c.id}/start"><button type="button">Connect</button></a>` : '<span class="badge">not set up</span>'}</div>
+      <small>${c.configured ? '' : `Add ${c.missing.join(', ')} to .env, restart. `}Redirect URI: ${esc(c.redirectUri)}</small></div>`).join('')
+    + (status.dryRun ? '<div class="conn"><button type="button" class="ghost" id="demo">Add demo accounts (dry-run testing)</button></div>' : '');
+  document.querySelectorAll('[data-rm]').forEach(b => b.onclick = async () => {
+    if (!confirm('Disconnect this account? Its queued posts will be marked failed.')) return;
+    await fetch('/api/accounts/' + b.dataset.rm, { method:'DELETE' }); await load(); openAccounts();
+  });
+  if ($('#demo')) $('#demo').onclick = async () => { await fetch('/api/accounts/demo', { method:'POST' }); await load(); openAccounts(); };
+  if (!$('#accounts').open) $('#accounts').showModal();
+}
+$('#acctBtn').onclick = () => openAccounts();
+$('#acctClose').onclick = () => $('#accounts').close();
+
+$('#newBtn').onclick = () => openComposer(new Date());
+$('#cancel').onclick = () => $('#composer').close();
+$('#prev').onclick = () => { cur.setMonth(cur.getMonth()-1); render(); };
+$('#next').onclick = () => { cur.setMonth(cur.getMonth()+1); render(); };
+$('#today').onclick = () => { cur = new Date(); cur.setDate(1); render(); };
+load().then(() => {
+  const q = new URLSearchParams(location.search);
+  if (q.has('connected') || q.has('error')) {
+    openAccounts(q.has('error') ? { ok:false, msg:q.get('error') } : { ok:true, msg:'Connected: ' + q.get('connected') });
+    history.replaceState(null, '', '/');
+  }
+});
+setInterval(load, 15000);
+</script>
+</body>
+</html>

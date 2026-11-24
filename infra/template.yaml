@@ -1,0 +1,338 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PostPilot backend: S3 media bucket, DynamoDB tables, a Lambda publisher fired by
+  one-time EventBridge Scheduler schedules (one per post, no polling), a least-privilege IAM user for the Vercel app, and a $ budget alert.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: postpilot
+    AllowedPattern: '^[a-z0-9-]{3,20}$'
+    Description: Prefix for resource names (lowercase letters, digits, hyphens).
+  AppOrigins:
+    Type: CommaDelimitedList
+    Default: 'http://localhost:3000'
+    Description: >
+      Origins allowed to upload media straight to S3 (CORS), e.g.
+      https://postpilot.yourdomain.com,http://localhost:3000
+  BillingMode:
+    Type: String
+    Default: PROVISIONED
+    AllowedValues: [PROVISIONED, PAY_PER_REQUEST]
+    Description: >
+      PROVISIONED stays inside the always-free DynamoDB allowance (25 RCU/WCU total).
+      PAY_PER_REQUEST is not covered by it, but costs cents at this scale.
+  MediaRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 7
+    Description: Media files are deleted from S3 after this many days.
+  DryRun:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: While 'true' the publisher only logs; nothing is posted. Set to 'false' to go live.
+  AlertEmail:
+    Type: String
+    Description: Email that gets an alert when AWS spend passes the budget below.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 1
+    MinValue: 1
+
+Conditions:
+  IsProvisioned: !Equals [!Ref BillingMode, PROVISIONED]
+
+Resources:
+  # ---------------------------------------------------------------- S3 (media)
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      # Objects under media/ are public-read: Instagram, Facebook and TikTok fetch them by URL.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: !Ref AppOrigins
+            AllowedMethods: [PUT, GET, HEAD]
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-media
+            Status: Enabled
+            Prefix: media/
+            ExpirationInDays: !Ref MediaRetentionDays
+          - Id: abort-stale-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadMedia
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${MediaBucket.Arn}/media/*'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt MediaBucket.Arn, !Sub '${MediaBucket.Arn}/*']
+            Condition: { Bool: { 'aws:SecureTransport': 'false' } }
+
+  # ---------------------------------------------------------------- DynamoDB
+  AccountsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AppName}-accounts'
+      BillingMode: !Ref BillingMode
+      ProvisionedThroughput: !If [IsProvisioned, { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }, !Ref 'AWS::NoValue']
+      AttributeDefinitions: [{ AttributeName: id, AttributeType: S }]
+      KeySchema: [{ AttributeName: id, KeyType: HASH }]
+
+  PostsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AppName}-posts'
+      BillingMode: !Ref BillingMode
+      ProvisionedThroughput: !If [IsProvisioned, { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }, !Ref 'AWS::NoValue']
+      AttributeDefinitions: [{ AttributeName: id, AttributeType: S }]
+      KeySchema: [{ AttributeName: id, KeyType: HASH }]
+
+  TargetsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AppName}-targets'
+      BillingMode: !Ref BillingMode
+      ProvisionedThroughput: !If [IsProvisioned, { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }, !Ref 'AWS::NoValue']
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: runAt, AttributeType: S }
+        - { AttributeName: postId, AttributeType: S }
+      KeySchema: [{ AttributeName: id, KeyType: HASH }]
+      GlobalSecondaryIndexes:
+        # the publisher asks: status = 'scheduled' AND runAt <= now
+        - IndexName: due
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: runAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: !If [IsProvisioned, { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }, !Ref 'AWS::NoValue']
+        # the UI asks: all targets of a post
+        - IndexName: byPost
+          KeySchema: [{ AttributeName: postId, KeyType: HASH }]
+          Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: !If [IsProvisioned, { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }, !Ref 'AWS::NoValue']
+
+  # ---------------------------------------------------------------- Lambda publisher
+  PublisherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AppName}-publisher'
+      RetentionInDays: 14
+
+  PublisherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: publisher
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt PublisherLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !GetAtt AccountsTable.Arn
+                  - !GetAtt PostsTable.Arn
+                  - !GetAtt TargetsTable.Arn
+                  - !Sub '${TargetsTable.Arn}/index/*'
+              - Effect: Allow # schedule retries of failed posts
+                Action: [scheduler:CreateSchedule, scheduler:DeleteSchedule, scheduler:GetSchedule]
+                Resource: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ScheduleGroup}/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SchedulerRole.Arn
+              - Effect: Allow
+                Action: s3:GetObject # YouTube uploads read the video from S3
+                Resource: !Sub '${MediaBucket.Arn}/media/*'
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParametersByPath] # OAuth client secrets (SSM Parameter Store, free tier)
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/*'
+
+  PublisherFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PublisherLogGroup
+    Properties:
+      FunctionName: !Sub '${AppName}-publisher'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt PublisherRole.Arn
+      Timeout: 900 # video uploads / Instagram processing can take minutes
+      MemorySize: 1024 # YouTube uploads buffer the whole video in memory
+      Environment:
+        Variables:
+          APP_NAME: !Ref AppName
+          DRY_RUN: !Ref DryRun
+          ACCOUNTS_TABLE: !Ref AccountsTable
+          POSTS_TABLE: !Ref PostsTable
+          TARGETS_TABLE: !Ref TargetsTable
+          MEDIA_BUCKET: !Ref MediaBucket
+          SCHEDULE_GROUP: !Ref ScheduleGroup
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerRole.Arn
+          FUNCTION_ARN: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppName}-publisher'
+          MEDIA_BASE_URL: !Sub 'https://${MediaBucket.RegionalDomainName}'
+      # Placeholder so the stack can be created; deploy the real code with
+      # `aws lambda update-function-code` (see infra/README.md).
+      Code:
+        ZipFile: |
+          exports.handler = async () => { console.log('placeholder: deploy the publisher code'); };
+
+  # ---------------------------------------------------------------- Scheduling
+  # The app creates one one-time schedule per post: at(<publish time>) -> publisher Lambda.
+  # Schedules delete themselves after firing. Idle cost: nothing runs when nothing is due.
+  ScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub '${AppName}-posts'
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' } }
+      Policies:
+        - PolicyName: invoke-publisher
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AppName}-publisher'
+
+  # Safety net: once an hour, pick up any post whose schedule was lost or failed to create.
+  SweepRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AppName}-hourly-sweep'
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Id: publisher
+          Arn: !GetAtt PublisherFunction.Arn
+          Input: '{"sweep": true}'
+
+  SweepPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PublisherFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SweepRule.Arn
+
+  # ---------------------------------------------------------------- Vercel's AWS identity
+  # No access key is created here (it would be exposed in stack outputs). Create it with the CLI.
+  VercelUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub '${AppName}-vercel'
+      Policies:
+        - PolicyName: app-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !GetAtt AccountsTable.Arn
+                  - !GetAtt PostsTable.Arn
+                  - !GetAtt TargetsTable.Arn
+                  - !Sub '${TargetsTable.Arn}/index/*'
+              - Effect: Allow # "post now" invokes the publisher directly
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt PublisherFunction.Arn
+              - Effect: Allow # create / move / cancel a post's one-time schedule
+                Action: [scheduler:CreateSchedule, scheduler:UpdateSchedule, scheduler:DeleteSchedule, scheduler:GetSchedule]
+                Resource: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ScheduleGroup}/*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SchedulerRole.Arn
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+                Resource: !Sub '${MediaBucket.Arn}/media/*'
+
+  # ---------------------------------------------------------------- Cost guard
+  Budget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub '${AppName}-monthly'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+
+Outputs:
+  MediaBucketName: { Value: !Ref MediaBucket }
+  MediaBaseUrl: { Value: !Sub 'https://${MediaBucket.RegionalDomainName}' }
+  AccountsTableName: { Value: !Ref AccountsTable }
+  PostsTableName: { Value: !Ref PostsTable }
+  TargetsTableName: { Value: !Ref TargetsTable }
+  PublisherFunctionName: { Value: !Ref PublisherFunction }
+  ScheduleGroupName: { Value: !Ref ScheduleGroup }
+  SchedulerRoleArn: { Value: !GetAtt SchedulerRole.Arn }
+  PublisherFunctionArn: { Value: !GetAtt PublisherFunction.Arn }
+  VercelUserName: { Value: !Ref VercelUser }
